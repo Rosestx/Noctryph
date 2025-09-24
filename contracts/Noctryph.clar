@@ -1,5 +1,6 @@
-;; Noctryph - Soulbound Token Identity System
+;; Noctryph - Soulbound Token Identity System with Multi-Chain Bridge
 ;; A metaverse passport system issuing soulbound tokens for digital identity and reputation
+;; Enhanced with cross-chain synchronization capabilities
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -9,12 +10,22 @@
 (define-constant ERR_INVALID_INPUT (err u400))
 (define-constant ERR_TRANSFER_NOT_ALLOWED (err u403))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u402))
+(define-constant ERR_BRIDGE_DISABLED (err u405))
+(define-constant ERR_INVALID_CHAIN (err u406))
 (define-constant MAX_TOKEN_ID u1000000)
 (define-constant MAX_CREDENTIAL_ID u10000)
+
+;; Multi-chain constants
+(define-constant CHAIN_ETHEREUM u1)
+(define-constant CHAIN_POLYGON u2)
+(define-constant CHAIN_SOLANA u3)
+(define-constant CHAIN_STACKS u4)
 
 ;; Data Variables
 (define-data-var next-token-id uint u1)
 (define-data-var contract-uri (string-utf8 256) u"https://noctryph.io/metadata/")
+(define-data-var bridge-enabled bool true)
+(define-data-var bridge-operator principal CONTRACT_OWNER)
 
 ;; Data Maps
 (define-map tokens
@@ -24,7 +35,9 @@
     metadata-uri: (string-utf8 256),
     badge-type: (string-ascii 32),
     mint-block: uint,
-    is-active: bool
+    is-active: bool,
+    origin-chain: uint,
+    sync-status: uint
   }
 )
 
@@ -34,7 +47,8 @@
     total-badges: uint,
     reputation-score: uint,
     last-activity: uint,
-    is-verified: bool
+    is-verified: bool,
+    cross-chain-synced: bool
   }
 )
 
@@ -65,6 +79,31 @@
   { token-id: uint, is-active: bool }
 )
 
+;; Multi-chain bridge mappings
+(define-map chain-bridges
+  { target-chain: uint }
+  {
+    bridge-address: (string-ascii 64),
+    is-active: bool,
+    last-sync: uint
+  }
+)
+
+(define-map cross-chain-tokens
+  { token-id: uint, target-chain: uint }
+  {
+    external-token-id: (string-ascii 128),
+    sync-hash: (string-ascii 64),
+    sync-block: uint,
+    is-synced: bool
+  }
+)
+
+(define-map bridge-operators
+  { operator: principal }
+  { is-authorized: bool }
+)
+
 ;; ALL PRIVATE FUNCTIONS FIRST
 (define-private (is-contract-owner)
   (is-eq tx-sender CONTRACT_OWNER)
@@ -72,6 +111,10 @@
 
 (define-private (is-authorized-verifier (verifier principal))
   (default-to false (get is-authorized (map-get? authorized-verifiers { verifier: verifier })))
+)
+
+(define-private (is-bridge-operator (operator principal))
+  (default-to false (get is-authorized (map-get? bridge-operators { operator: operator })))
 )
 
 (define-private (validate-string-input (input (string-utf8 256)))
@@ -85,6 +128,27 @@
   (and 
     (> (len input) u0)
     (<= (len input) u32)
+  )
+)
+
+(define-private (validate-bridge-address (input (string-ascii 64)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) u64)
+  )
+)
+
+(define-private (validate-external-token-id (input (string-ascii 128)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) u128)
+  )
+)
+
+(define-private (validate-sync-hash (input (string-ascii 64)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) u64)
   )
 )
 
@@ -112,6 +176,15 @@
   (not (is-eq user 'SP000000000000000000002Q6VF78))
 )
 
+(define-private (validate-chain-id (target-chain uint))
+  (or 
+    (is-eq target-chain CHAIN_ETHEREUM)
+    (is-eq target-chain CHAIN_POLYGON)
+    (is-eq target-chain CHAIN_SOLANA)
+    (is-eq target-chain CHAIN_STACKS)
+  )
+)
+
 (define-private (user-has-badge-type (recipient principal) (badge-type (string-ascii 32)))
   (match (map-get? user-badge-types { user: recipient, badge-type: badge-type })
     badge-entry
@@ -131,6 +204,18 @@
   )
 )
 
+(define-private (is-bridge-enabled)
+  (var-get bridge-enabled)
+)
+
+(define-private (is-chain-bridge-active (target-chain uint))
+  (match (map-get? chain-bridges { target-chain: target-chain })
+    bridge-info
+    (get is-active bridge-info)
+    false
+  )
+)
+
 ;; PUBLIC FUNCTIONS
 (define-public (mint-identity-badge (recipient principal) (badge-type (string-ascii 32)) (metadata-uri (string-utf8 256)))
   (let
@@ -147,7 +232,7 @@
     ;; Check if user already has this badge type
     (asserts! (not (user-has-badge-type recipient badge-type)) ERR_ALREADY_EXISTS)
     
-    ;; Mint the token
+    ;; Mint the token with multi-chain support
     (map-set tokens
       { token-id: token-id }
       {
@@ -155,7 +240,9 @@
         metadata-uri: metadata-uri,
         badge-type: badge-type,
         mint-block: current-block,
-        is-active: true
+        is-active: true,
+        origin-chain: CHAIN_STACKS,
+        sync-status: u0
       }
     )
     
@@ -182,7 +269,8 @@
           total-badges: u1,
           reputation-score: u100,
           last-activity: current-block,
-          is-verified: false
+          is-verified: false,
+          cross-chain-synced: false
         }
       )
     )
@@ -248,6 +336,130 @@
   )
 )
 
+;; Multi-Chain Bridge Functions
+(define-public (setup-chain-bridge (target-chain uint) (bridge-address (string-ascii 64)))
+  (begin
+    (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-chain-id target-chain) ERR_INVALID_CHAIN)
+    (asserts! (validate-bridge-address bridge-address) ERR_INVALID_INPUT)
+    
+    (map-set chain-bridges
+      { target-chain: target-chain }
+      {
+        bridge-address: bridge-address,
+        is-active: true,
+        last-sync: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (sync-token-cross-chain (token-id uint) (target-chain uint) (external-token-id (string-ascii 128)) (sync-hash (string-ascii 64)))
+  (let
+    (
+      (token-data (unwrap! (map-get? tokens { token-id: token-id }) ERR_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-bridge-enabled) ERR_BRIDGE_DISABLED)
+    (asserts! (is-bridge-operator tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-token-id token-id) ERR_INVALID_INPUT)
+    (asserts! (validate-chain-id target-chain) ERR_INVALID_CHAIN)
+    (asserts! (is-chain-bridge-active target-chain) ERR_BRIDGE_DISABLED)
+    (asserts! (validate-external-token-id external-token-id) ERR_INVALID_INPUT)
+    (asserts! (validate-sync-hash sync-hash) ERR_INVALID_INPUT)
+    (asserts! (get is-active token-data) ERR_NOT_FOUND)
+    
+    ;; Record cross-chain sync
+    (map-set cross-chain-tokens
+      { token-id: token-id, target-chain: target-chain }
+      {
+        external-token-id: external-token-id,
+        sync-hash: sync-hash,
+        sync-block: current-block,
+        is-synced: true
+      }
+    )
+    
+    ;; Update token sync status
+    (map-set tokens
+      { token-id: token-id }
+      (merge token-data { sync-status: (+ (get sync-status token-data) u1) })
+    )
+    
+    ;; Update user profile cross-chain sync status
+    (match (map-get? user-profiles { user: (get owner token-data) })
+      profile
+      (map-set user-profiles
+        { user: (get owner token-data) }
+        (merge profile { cross-chain-synced: true })
+      )
+      false
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (authorize-bridge-operator (operator principal))
+  (begin
+    (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-principal operator) ERR_INVALID_INPUT)
+    
+    (map-set bridge-operators
+      { operator: operator }
+      { is-authorized: true }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-bridge-operator (operator principal))
+  (begin
+    (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-principal operator) ERR_INVALID_INPUT)
+    
+    (map-set bridge-operators
+      { operator: operator }
+      { is-authorized: false }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (toggle-bridge (enabled bool))
+  (begin
+    (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+    
+    (var-set bridge-enabled enabled)
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-chain-bridge (target-chain uint))
+  (begin
+    (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-chain-id target-chain) ERR_INVALID_CHAIN)
+    
+    (match (map-get? chain-bridges { target-chain: target-chain })
+      bridge-info
+      (begin
+        (map-set chain-bridges
+          { target-chain: target-chain }
+          (merge bridge-info { is-active: false })
+        )
+        (ok true)
+      )
+      ERR_NOT_FOUND
+    )
+  )
+)
+
+;; Existing functions with validation fixes
 (define-public (verify-user (user principal))
   (let
     (
@@ -328,7 +540,7 @@
   ERR_TRANSFER_NOT_ALLOWED
 )
 
-;; READ-ONLY FUNCTIONS - FIXED VALIDATION ISSUES
+;; READ-ONLY FUNCTIONS
 (define-read-only (get-token-metadata (token-id uint))
   (if (and (> token-id u0) (<= token-id MAX_TOKEN_ID))
     (map-get? tokens { token-id: token-id })
@@ -452,8 +664,70 @@
   )
 )
 
+;; Multi-chain read-only functions
+(define-read-only (get-bridge-status)
+  {
+    bridge-enabled: (var-get bridge-enabled),
+    bridge-operator: (var-get bridge-operator)
+  }
+)
+
+(define-read-only (get-chain-bridge-info (target-chain uint))
+  (if (validate-chain-id target-chain)
+    (map-get? chain-bridges { target-chain: target-chain })
+    none
+  )
+)
+
+(define-read-only (get-cross-chain-token-info (token-id uint) (target-chain uint))
+  (if (and 
+        (> token-id u0) 
+        (<= token-id MAX_TOKEN_ID) 
+        (validate-chain-id target-chain))
+    (map-get? cross-chain-tokens { token-id: token-id, target-chain: target-chain })
+    none
+  )
+)
+
+(define-read-only (is-bridge-operator-check (operator principal))
+  (if (validate-principal operator)
+    (is-bridge-operator operator)
+    false
+  )
+)
+
+(define-read-only (get-token-sync-status (token-id uint))
+  (if (and (> token-id u0) (<= token-id MAX_TOKEN_ID))
+    (match (map-get? tokens { token-id: token-id })
+      token-data
+      (ok {
+        sync-status: (get sync-status token-data),
+        origin-chain: (get origin-chain token-data)
+      })
+      ERR_NOT_FOUND
+    )
+    ERR_INVALID_INPUT
+  )
+)
+
+(define-read-only (is-user-cross-chain-synced (user principal))
+  (if (validate-principal user)
+    (match (map-get? user-profiles { user: user })
+      profile
+      (get cross-chain-synced profile)
+      false
+    )
+    false
+  )
+)
+
 ;; Initialize contract
 (map-set authorized-verifiers
   { verifier: CONTRACT_OWNER }
+  { is-authorized: true }
+)
+
+(map-set bridge-operators
+  { operator: CONTRACT_OWNER }
   { is-authorized: true }
 )
